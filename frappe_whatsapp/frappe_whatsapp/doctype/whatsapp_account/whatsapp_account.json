@@ -17,6 +17,7 @@
   "column_break_byyq",
   "phone_id",
   "app_id",
+  "app_secret",
   "business_id",
   "is_default_incoming",
   "is_default_outgoing",
@@ -55,6 +56,13 @@
    "fieldname": "app_id",
    "fieldtype": "Data",
    "label": "App ID"
+  },
+  {
+   "description": "Meta App Secret used to verify X-Hub-Signature-256 before webhook data is logged or processed.",
+   "fieldname": "app_secret",
+   "fieldtype": "Password",
+   "label": "App Secret",
+   "length": 300
   },
   {
    "fieldname": "webhook_verify_token",
