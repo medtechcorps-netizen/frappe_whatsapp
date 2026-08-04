@@ -8,6 +8,10 @@ from werkzeug.wrappers import Response
 import frappe.utils
 
 from frappe_whatsapp.utils import get_whatsapp_account
+from frappe_whatsapp.utils.webhook_security import verify_meta_signature
+
+
+MAX_META_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024
 
 
 @frappe.whitelist(allow_guest=True)
@@ -15,7 +19,11 @@ def webhook():
 	"""Meta webhook."""
 	if frappe.request.method == "GET":
 		return get()
-	return post()
+
+	raw_body = _get_raw_webhook_body()
+	data = _decode_webhook_body(raw_body)
+	_authenticate_meta_webhook(data, raw_body)
+	return post(data)
 
 
 def get():
@@ -35,9 +43,106 @@ def get():
 
 	return Response(hub_challenge, status=200)
 
-def post():
+def _get_raw_webhook_body():
+	"""Return exact request bytes used by Meta to calculate its signature."""
+	raw_body = frappe.request.get_data(cache=True, as_text=False)
+	if isinstance(raw_body, str):
+		raw_body = raw_body.encode("utf-8")
+	if not isinstance(raw_body, bytes) or not raw_body:
+		_reject_webhook()
+	if len(raw_body) > MAX_META_WEBHOOK_BODY_BYTES:
+		_reject_webhook()
+	return raw_body
+
+
+def _decode_webhook_body(raw_body):
+	"""Parse an authenticated candidate without re-serializing its bytes."""
+	try:
+		data = json.loads(raw_body.decode("utf-8"))
+	except (UnicodeDecodeError, json.JSONDecodeError):
+		_reject_webhook()
+
+	if not isinstance(data, dict):
+		_reject_webhook()
+	return data
+
+
+def _candidate_account_names(data):
+	"""Resolve only accounts referenced by the untrusted routing metadata."""
+	entries = data.get("entry", [])
+	if isinstance(entries, dict):
+		entries = [entries]
+	if not isinstance(entries, list):
+		return []
+
+	phone_ids = set()
+	business_ids = set()
+	for entry in entries[:100]:
+		if not isinstance(entry, dict):
+			continue
+		entry_id = entry.get("id")
+		if isinstance(entry_id, str) and entry_id:
+			business_ids.add(entry_id[:255])
+
+		changes = entry.get("changes", [])
+		if isinstance(changes, dict):
+			changes = [changes]
+		if not isinstance(changes, list):
+			continue
+		for change in changes[:100]:
+			if not isinstance(change, dict):
+				continue
+			value = change.get("value", {})
+			if not isinstance(value, dict):
+				continue
+			metadata = value.get("metadata", {})
+			if not isinstance(metadata, dict):
+				continue
+			phone_id = metadata.get("phone_number_id")
+			if isinstance(phone_id, str) and phone_id:
+				phone_ids.add(phone_id[:255])
+
+	account_names = []
+	for phone_id in phone_ids:
+		name = frappe.db.get_value("WhatsApp Account", {"phone_id": phone_id}, "name")
+		if name and name not in account_names:
+			account_names.append(name)
+
+	# Some valid events (for example template status changes) have no phone ID.
+	# Their entry ID is the subscribed WhatsApp Business Account ID.
+	if not account_names:
+		for business_id in business_ids:
+			for name in frappe.get_all(
+				"WhatsApp Account",
+				filters={"business_id": business_id},
+				pluck="name",
+				limit_page_length=100,
+			):
+				if name not in account_names:
+					account_names.append(name)
+
+	return account_names
+
+
+def _authenticate_meta_webhook(data, raw_body):
+	"""Fail closed before logging or processing an unsigned Meta request."""
+	signature = frappe.request.headers.get("X-Hub-Signature-256", "")
+	for account_name in _candidate_account_names(data):
+		account = frappe.get_doc("WhatsApp Account", account_name)
+		app_secret = account.get_password("app_secret", raise_exception=False)
+		if verify_meta_signature(app_secret, raw_body, signature):
+			return account
+
+	_reject_webhook()
+
+
+def _reject_webhook():
+	"""Return one indistinguishable error for missing account, secret, or signature."""
+	frappe.throw(_("Webhook authentication failed"), frappe.AuthenticationError)
+
+
+def post(data):
 	"""Post."""
-	data = frappe.local.form_dict
 	frappe.get_doc({
 		"doctype": "WhatsApp Notification Log",
 		"template": "Webhook",
