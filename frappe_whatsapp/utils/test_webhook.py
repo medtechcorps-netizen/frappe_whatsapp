@@ -8,6 +8,7 @@ import frappe
 from frappe_whatsapp.testing import IntegrationTestCase
 
 from frappe_whatsapp.utils.webhook import (
+    _message_sender_id,
     update_message_status,
     update_status,
     update_template_status,
@@ -67,6 +68,16 @@ class TestWebhookHelpers(IntegrationTestCase):
         }
         # Should not raise
         update_status(data)
+
+    def test_message_sender_id_prefers_from_and_falls_back_to_from_user_id(self):
+        self.assertEqual(
+            _message_sender_id({"from": "919900112200", "from_user_id": "user_1"}),
+            "919900112200",
+        )
+        self.assertEqual(
+            _message_sender_id({"from": "  ", "from_user_id": " user_1 "}),
+            "user_1",
+        )
 
     def test_update_message_status(self):
         """Test update_message_status updates WhatsApp Message status."""
@@ -283,6 +294,109 @@ class TestWebhookEndpoint(IntegrationTestCase):
         self.assertEqual(msg.type, "Incoming")
         self.assertEqual(msg.message, "Hello from webhook test")
         self.assertEqual(msg.content_type, "text")
+
+    def test_webhook_post_text_message_with_business_scoped_user_id(self):
+        """Username-era payloads use from_user_id when from is empty."""
+        sender_id = "919900112276_user_id"
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "webhook_ep_phone_id"},
+                        "contacts": [{
+                            "profile": {"name": "User ID Sender"},
+                            "wa_id": "",
+                            "user_id": sender_id,
+                            "username": "user.id.sender",
+                        }],
+                        "messages": [{
+                            "from": "",
+                            "from_user_id": sender_id,
+                            "id": "wamid.webhook_ep_from_user_id",
+                            "type": "text",
+                            "text": {"body": "Hello from a username account"},
+                        }],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        frappe.local.form_dict = frappe._dict(payload)
+
+        with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
+            from frappe_whatsapp.utils.webhook import webhook
+            webhook()
+
+        msg = frappe.get_doc(
+            "WhatsApp Message", {"message_id": "wamid.webhook_ep_from_user_id"}
+        )
+        self.assertEqual(msg.get("from"), sender_id)
+        self.assertEqual(msg.profile_name, "User ID Sender")
+        profile = frappe.get_doc("WhatsApp Profiles", {"number": sender_id})
+        self.assertEqual(profile.profile_name, "User ID Sender")
+
+    def test_webhook_logs_bad_message_and_keeps_authenticated_batch(self):
+        """One bad envelope must not erase the raw log or later valid messages."""
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "webhook_ep_phone_id"},
+                        "contacts": [{
+                            "profile": {"name": "Valid Sender"},
+                            "wa_id": "919900112275",
+                        }],
+                        "messages": [
+                            {
+                                "id": "wamid.webhook_ep_bad_envelope",
+                                "type": "text",
+                                "text": {"body": "Missing sender"},
+                            },
+                            {
+                                "from": "919900112275",
+                                "id": "wamid.webhook_ep_after_bad_envelope",
+                                "type": "text",
+                                "text": {"body": "Still process this message"},
+                            },
+                        ],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        frappe.local.form_dict = frappe._dict(payload)
+        log_count = frappe.db.count(
+            "WhatsApp Notification Log", filters={"template": "Webhook"}
+        )
+
+        with (
+            patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request),
+            patch("frappe_whatsapp.utils.webhook.frappe.log_error") as log_error,
+        ):
+            from frappe_whatsapp.utils.webhook import webhook
+            webhook()
+
+        self.assertEqual(
+            frappe.db.count(
+                "WhatsApp Notification Log", filters={"template": "Webhook"}
+            ),
+            log_count + 1,
+        )
+        self.assertFalse(
+            frappe.db.exists(
+                "WhatsApp Message", {"message_id": "wamid.webhook_ep_bad_envelope"}
+            )
+        )
+        self.assertTrue(
+            frappe.db.exists(
+                "WhatsApp Message",
+                {"message_id": "wamid.webhook_ep_after_bad_envelope"},
+            )
+        )
+        log_error.assert_called_once()
+        error_message = log_error.call_args.kwargs["message"]
+        self.assertIn("wamid.webhook_ep_bad_envelope", error_message)
+        self.assertIn("_MessageEnvelopeError", error_message)
 
     def test_webhook_rejects_invalid_signature_before_writes(self):
         """An invalid signature must not create a log or message."""
