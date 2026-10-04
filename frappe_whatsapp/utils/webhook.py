@@ -233,6 +233,10 @@ def _log_message_processing_error(message):
 
 
 def _process_incoming_message(message, whatsapp_account, contacts, sender_id):
+	if whatsapp_account.get("transport_provider") == "ReReply":
+		# Coexistence incoming messages enter via the signed ReReply adapter.
+		# A residual shared Meta callback must not trigger the ERP bot again.
+		return
 	sender_profile_name = _sender_profile_name(contacts, sender_id)
 	message_type = message['type']
 	is_reply = True if message.get('context') and 'forwarded' not in message.get('context') else False

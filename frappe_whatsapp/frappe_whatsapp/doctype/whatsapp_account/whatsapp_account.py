@@ -8,6 +8,49 @@ from frappe.model.document import Document
 
 
 class WhatsAppAccount(Document):
+	def validate(self):
+		if self.get("transport_provider") != "ReReply":
+			return
+		from urllib.parse import urlsplit
+		from uuid import UUID
+		import hmac
+		base = urlsplit(self.get("rereply_base_url") or "")
+		if base.scheme != "https" or not base.hostname or base.username or base.password or base.query or base.fragment or base.path not in ("", "/"):
+			frappe.throw(_("ReReply URL must be an HTTPS origin without credentials, path, or query."))
+		for field in ("rereply_workspace_id", "rereply_account_id"):
+			try:
+				UUID(self.get(field) or "")
+			except ValueError:
+				frappe.throw(_("A valid ReReply workspace ID and WhatsApp account ID are required."))
+		if not self.get("rereply_account_name"):
+			frappe.throw(_("The exact ReReply WhatsApp account name is required."))
+		if self.get("rereply_integration_user_id"):
+			try:
+				UUID(self.rereply_integration_user_id)
+			except ValueError:
+				frappe.throw(_("The ReReply integration user ID must be a UUID."))
+		if self.get("rereply_inbound_enabled") and not self.get("rereply_outbound_enabled"):
+			frappe.throw(_("Enable and validate ReReply sending before enabling incoming ERP automation."))
+		if self.get("rereply_outbound_enabled") and not self.get_password("rereply_api_key", raise_exception=False):
+			frappe.throw(_("A ReReply API key is required before sending is enabled."))
+		if self.get("rereply_inbound_enabled") and not self.get_password("rereply_webhook_secret", raise_exception=False):
+			frappe.throw(_("A dedicated ReReply webhook signing secret is required."))
+		duplicates = frappe.get_all("WhatsApp Account", filters={
+			"transport_provider": "ReReply", "rereply_workspace_id": self.rereply_workspace_id,
+			"rereply_account_id": self.rereply_account_id, "name": ["!=", self.name or ""],
+		}, limit_page_length=1)
+		if duplicates:
+			frappe.throw(_("This ReReply WhatsApp account is already connected to another ERP account."))
+		secret = self.get_password("rereply_webhook_secret", raise_exception=False)
+		if secret:
+			if len(secret) < 32:
+				frappe.throw(_("Use a dedicated webhook secret of at least 32 characters."))
+			for other in frappe.get_all("WhatsApp Account", filters={
+				"transport_provider": "ReReply", "name": ["!=", self.name or ""],
+			}, pluck="name"):
+				other_secret = frappe.get_doc("WhatsApp Account", other).get_password("rereply_webhook_secret", raise_exception=False)
+				if other_secret and hmac.compare_digest(secret, other_secret):
+					frappe.throw(_("Each ERP ReReply account must use its own webhook signing secret."))
 	def on_update(self):
 		"""Check there is only one default of each type."""
 		self.there_must_be_only_one_default()
@@ -33,6 +76,8 @@ class WhatsAppAccount(Document):
 		Required after phone number registration to receive incoming messages.
 		Calls POST /{version}/{business_id}/subscribed_apps on the Graph API.
 		"""
+		if self.get("transport_provider") == "ReReply":
+			frappe.throw(_("Manage Meta webhook subscriptions in ReReply for this account."))
 		for field in ("url", "version", "business_id"):
 			if not self.get(field):
 				frappe.throw(_("{0} is required to subscribe the app").format(

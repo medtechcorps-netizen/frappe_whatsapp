@@ -165,6 +165,9 @@ class BulkWhatsAppMessage(Document):
     def resend_single_message(self, message_name):
         """Worker entry: re-send a single failed WhatsApp Message."""
         message_doc = frappe.get_doc("WhatsApp Message", message_name)
+        if message_doc.get("rereply_send_state"):
+            from frappe_whatsapp.utils.rereply_queue import retry_rejected_message
+            return retry_rejected_message(message_name)
         # Clear the prior message_id so the template send path (which gates
         # on `not self.message_id`) runs again.
         message_doc.message_id = None
@@ -186,7 +189,7 @@ class BulkWhatsAppMessage(Document):
         total = self.recipient_count
         sent = frappe.db.count("WhatsApp Message", {
             "bulk_message_reference": self.name,
-            "status": ["in", ["sent","delivered", "Success", "read"]]
+            "status": ["in", ["sent","delivered", "Success", "read", "Sent", "Delivered", "Read"]]
         })
         failed = frappe.db.count("WhatsApp Message", {
             "bulk_message_reference": self.name,
@@ -194,7 +197,7 @@ class BulkWhatsAppMessage(Document):
         })
         queued = frappe.db.count("WhatsApp Message", {
             "bulk_message_reference": self.name,
-            "status": "Queued"
+            "status": ["in", ["Queued", "Pending", "Sending"]]
         })
         
         return {

@@ -117,7 +117,9 @@ app_include_js = "/assets/frappe_whatsapp/js/frappe_whatsapp.js"
 scheduler_events = {
     "all": [
         "frappe_whatsapp.utils.trigger_whatsapp_notifications_all",
-        "frappe_whatsapp.utils.bulk_messaging.process_scheduled_bulk_messages"
+        "frappe_whatsapp.utils.bulk_messaging.process_scheduled_bulk_messages",
+        "frappe_whatsapp.utils.rereply_queue.recover_queued_messages",
+        "frappe_whatsapp.utils.rereply_webhook.recover_pending_webhooks",
     ],
     "hourly": [
         "frappe_whatsapp.utils.trigger_whatsapp_notifications_hourly"
