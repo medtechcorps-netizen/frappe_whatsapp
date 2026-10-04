@@ -269,9 +269,11 @@ pause. A site without this DocType must supply its own handoff integration.
     # now_datetime is in the site's timezone; use an elapsed-time offset
     # rather than inserting a UTC wall time into a Frappe Datetime column.
     paused_until = frappe.utils.now_datetime() + timedelta(seconds=300 - max(age, 0))
+    # The bot reads the newest creation, including explicit resume records.
+    # An older, longer expiry must not hide a newer resume or shorter pause.
     existing = frappe.db.sql(
         "SELECT paused_until FROM `tabWhatsApp Bot Pause` WHERE phone=%s "
-        "ORDER BY paused_until DESC LIMIT 1 FOR UPDATE", (phone,)
+        "ORDER BY creation DESC LIMIT 1 FOR UPDATE", (phone,)
     )
     if existing and frappe.utils.get_datetime(existing[0][0]) >= paused_until:
         return

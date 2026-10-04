@@ -102,9 +102,11 @@ class _DB:
     def sql(self, query, args):
         self.app.operations.append(("lock", args[0]))
         if "SELECT paused_until" in query:
-            pauses = [row["paused_until"] for (kind, _), row in self.rows.items()
+            pauses = [row for (kind, _), row in self.rows.items()
                       if kind == "WhatsApp Bot Pause" and row["phone"] == args[0]]
-            return [(max(pauses),)] if pauses else []
+            ordering = "creation" if "ORDER BY creation DESC" in query else "paused_until"
+            latest = max(pauses, key=lambda row: row[ordering]) if pauses else None
+            return [(latest["paused_until"],)] if latest else []
         return [(args[0],)] if ("ReReply Webhook Receipt", args[0]) in self.rows else []
 
 
@@ -429,6 +431,7 @@ class TestReReplyWebhook(TestCase):
         longer = datetime.now() + timedelta(hours=1)
         self.app.db.rows[("WhatsApp Bot Pause", "existing-pause")] = {
             "name": "existing-pause", "phone": "60123334444", "paused_until": longer,
+            "creation": datetime.now() - timedelta(minutes=1),
         }
         self.payload["event"] = "message.outgoing"
         self.payload["data"]["direction"] = "outgoing"
@@ -436,6 +439,29 @@ class TestReReplyWebhook(TestCase):
         self.module.process_receipt(name)
         self.assertEqual(len(self._pauses()), 1)
         self.assertEqual(self._pauses()[0]["paused_until"], longer)
+
+    def test_new_activity_pauses_after_newer_resume_overrides_historical_long_pause(self):
+        self._enable_pause()
+        now = datetime.now()
+        for name, created, expiry in (
+            ("older-long-pause", now - timedelta(minutes=2), now + timedelta(hours=1)),
+            ("newer-resume", now - timedelta(minutes=1), now - timedelta(minutes=1)),
+        ):
+            self.app.db.rows[("WhatsApp Bot Pause", name)] = {
+                "name": name, "phone": "60123334444", "paused_until": expiry, "creation": created,
+            }
+        self.payload["event"] = "message.outgoing"
+        self.payload["data"]["direction"] = "outgoing"
+        name = self.ingest()
+        self.module.process_receipt(name)
+        self.assertEqual(self.receipt(name)["status"], "Processed")
+        pauses = self._pauses()
+        self.assertEqual(len(pauses), 3)
+        current = max(pauses, key=lambda row: row["creation"])
+        self.assertEqual(current["source"], "ReReplyMobile")
+        remaining = (current["paused_until"] - datetime.now()).total_seconds()
+        self.assertGreater(remaining, 295)
+        self.assertLessEqual(remaining, 300)
 
     def test_missing_pause_schema_logs_only(self):
         self._enable_pause()

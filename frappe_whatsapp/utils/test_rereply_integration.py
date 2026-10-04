@@ -10,7 +10,6 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import frappe
-from frappe.utils.password import set_encrypted_password
 
 from frappe_whatsapp.testing import IntegrationTestCase
 from frappe_whatsapp.utils import rereply_queue
@@ -53,10 +52,14 @@ class TestReReplyIntegration(IntegrationTestCase):
             "rereply_outbound_enabled": 0, "rereply_inbound_enabled": 0,
             "is_default_incoming": 0, "is_default_outgoing": 0,
         }).insert(ignore_permissions=True)
-        set_encrypted_password("WhatsApp Account", self.account.name,
-                               "integration-test-key-not-a-credential", "rereply_api_key")
+        # Save through the Password field. Saving an empty field after writing
+        # __Auth directly clears the encrypted value on Frappe 16.
+        self.account.rereply_api_key = "integration-test-key-not-a-credential"
         self.account.rereply_outbound_enabled = 1
         self.account.save(ignore_permissions=True)
+        self.account = frappe.get_doc("WhatsApp Account", self.account.name)
+        self.assertEqual(self.account.get_password("rereply_api_key"),
+                         "integration-test-key-not-a-credential")
         self.enqueue.reset_mock()
 
     def tearDown(self):
