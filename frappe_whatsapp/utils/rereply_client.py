@@ -221,6 +221,38 @@ class ReReplyClient:
                 return results
         raise ReReplyError("ReReply lookup exceeded its safe result limit.")
 
+    def template_details(self, name, language):
+        """Read one exact template; never create, publish, or change it."""
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9_]+", name):
+            raise ReReplyError("Use the exact ReReply template name.")
+        if not isinstance(language, str) or not language:
+            raise ReReplyError("The exact ReReply template language is required.")
+        rows = self._list(
+            "/api/templates", "templates", {"account": self.config["account_name"], "search": name},
+        )
+        matches = [row for row in rows if row.get("name") == name
+                   and row.get("language") == language
+                   and row.get("whatsapp_account") == self.config["account_name"]]
+        if len(matches) != 1:
+            raise ReReplyError("Exactly one ReReply template must match account, name and language; manage templates in ReReply.")
+        template_id = _uuid(matches[0].get("id"), "template ID")
+        detail = self._call("GET", "/api/templates/" + template_id)
+        if (detail.get("id") != template_id or detail.get("name") != name
+                or detail.get("language") != language
+                or detail.get("whatsapp_account") != self.config["account_name"]):
+            raise ReReplyError("ReReply template identity does not match the requested account, name and language.")
+        if not isinstance(detail.get("body_content"), str) or not detail["body_content"]:
+            raise ReReplyError("ReReply template body is unavailable.")
+        status = detail.get("status")
+        if not isinstance(status, str) or not status:
+            raise ReReplyError("ReReply template status is unavailable.")
+        meta_id = detail.get("meta_template_id")
+        if (meta_id and (not isinstance(meta_id, str) or not meta_id.isdigit())) or (
+            status.upper() == "APPROVED" and not meta_id
+        ):
+            raise ReReplyError("ReReply template Meta identity is unavailable or invalid.")
+        return detail
+
     def _find_contact(self, phone):
         rows = self._list("/api/contacts", "contacts", {"search": phone})
         matches = []
@@ -446,3 +478,12 @@ def get_message_status(account, contact_id, message_id, request=None):
     client = ReReplyClient(account, request=request)
     client.verify_account()
     return client.message_status(contact_id, message_id)
+
+
+def get_template_details(account, name, language, request=None):
+    """Read a mirror only after verifying the configured current phone and WABA."""
+    if not account.get("phone_id") or not account.get("business_id"):
+        raise ReReplyError("Set the current ReReply phone ID and business account ID before importing templates.")
+    client = ReReplyClient(account, request=request)
+    client.verify_account()
+    return client.template_details(name, language)

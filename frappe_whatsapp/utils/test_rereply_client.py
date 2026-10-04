@@ -66,7 +66,66 @@ def text_payload():
     return {"messaging_product": "whatsapp", "to": "+60 12-345 6789", "type": "text", "text": {"body": "Hello"}}
 
 
+def template_detail(**changes):
+    result = dict(id=TEMPLATE, name="order_dispatched", language="ms", whatsapp_account=NAME,
+                  meta_template_id="123456789", status="APPROVED", category="UTILITY",
+                  body_content="Salam {{1}}", header_type="NONE", header_content="", footer_content="",
+                  buttons=[], sample_values=[{"component": "body", "index": 1, "value": "Pelanggan"}])
+    result.update(changes)
+    return result
+
+
 class ReReplyClientTest(unittest.TestCase):
+    def test_template_mirror_reads_exact_account_language_and_details_only(self):
+        row = template_detail()
+        request = Mock(side_effect=[verified(), response({"templates": [row, template_detail(language="en")], "total": 2}), response(row)])
+        result = client.get_template_details(account(), "order_dispatched", "ms", request=request)
+        self.assertEqual(result, row)
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "GET", "GET"])
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["account"], NAME)
+        self.assertNotIn("status", request.call_args_list[1].kwargs["params"])
+        self.assertEqual(request.call_args.args[1], "https://app.rereply.app/api/templates/" + TEMPLATE)
+        for call in request.call_args_list:
+            self.assertEqual(call.kwargs["headers"]["X-Organization-ID"], WORKSPACE)
+            self.assertFalse(call.kwargs["allow_redirects"])
+
+    def test_template_mirror_requires_current_phone_and_waba_pins(self):
+        for changed in ({"phone_id": ""}, {"business_id": ""}):
+            request = Mock()
+            with self.assertRaises(client.ReReplyError):
+                client.get_template_details(account(**changed), "order_dispatched", "ms", request=request)
+            request.assert_not_called()
+        for changed in ({"phone_id": "old-phone"}, {"business_id": "old-waba"}, {"id": CONTACT}, {"name": "Other"}):
+            request = Mock(return_value=verified(**changed))
+            with self.assertRaises(client.ReReplyError):
+                client.get_template_details(account(), "order_dispatched", "ms", request=request)
+            self.assertEqual(request.call_count, 1)
+
+    def test_template_mirror_rejects_missing_ambiguous_or_wrong_scope_match(self):
+        for rows in ([], [template_detail(), template_detail(id=REPLY)],
+                     [template_detail(whatsapp_account="Other")], [template_detail(language="en")]):
+            request = Mock(side_effect=[verified(), response({"templates": rows, "total": len(rows)})])
+            with self.assertRaises(client.ReReplyError):
+                client.get_template_details(account(), "order_dispatched", "ms", request=request)
+            self.assertEqual(request.call_count, 2)
+
+    def test_template_mirror_revalidates_detail_identity_and_approved_meta_id(self):
+        for changed in ({"id": REPLY}, {"name": "other"}, {"language": "en"},
+                        {"whatsapp_account": "Other"}, {"meta_template_id": ""},
+                        {"meta_template_id": TEMPLATE}, {"body_content": None}, {"status": ""}):
+            request = Mock(side_effect=[verified(), response({"templates": [template_detail()], "total": 1}),
+                                       response(template_detail(**changed))])
+            with self.assertRaises(client.ReReplyError):
+                client.get_template_details(account(), "order_dispatched", "ms", request=request)
+            self.assertEqual(request.call_count, 3)
+
+    def test_template_mirror_returns_actual_draft_state_without_fabricating_approval(self):
+        row = template_detail(status="DRAFT", meta_template_id="")
+        request = Mock(side_effect=[verified(), response({"templates": [row], "total": 1}), response(row)])
+        result = client.get_template_details(account(), "order_dispatched", "ms", request=request)
+        self.assertEqual(result["status"], "DRAFT")
+        self.assertEqual(result["meta_template_id"], "")
+
     def test_text_send_scopes_every_request_and_recovers_wamid(self):
         request = Mock(side_effect=[verified(), contacts(), accepted(), history()])
         result = client.send_via_rereply(account(), text_payload(), request=request)

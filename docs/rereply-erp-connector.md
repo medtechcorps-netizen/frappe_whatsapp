@@ -32,6 +32,10 @@ retain their previous transport.
    jointly establish the route. Do not reuse signing secrets across workspaces.
 6. Verify the new account's approved templates in ReReply. Old ERP approval
    records belong to the old WABA and do not establish approval in the new one.
+   Create and publish provider templates in ReReply. For a ReReply account,
+   ERP template insert/save only verifies the exact account, name, language and
+   content against ReReply and mirrors its status and Meta ID. It never publishes
+   templates or uploads template samples through the former Meta credentials.
 7. Validate outbound sending to an explicitly authorized test recipient before
    enabling ERP inbound automation. Keep competing ReReply automatic responders
    off for this account. Enable incoming processing and the outbound webhook
