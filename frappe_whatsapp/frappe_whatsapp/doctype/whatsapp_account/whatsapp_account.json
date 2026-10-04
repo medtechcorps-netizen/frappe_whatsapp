@@ -21,7 +21,18 @@
   "business_id",
   "is_default_incoming",
   "is_default_outgoing",
-  "allow_auto_read_receipt"
+  "allow_auto_read_receipt",
+  "rereply_section",
+  "transport_provider",
+  "rereply_base_url",
+  "rereply_workspace_id",
+  "rereply_account_id",
+  "rereply_account_name",
+  "rereply_api_key",
+  "rereply_webhook_secret",
+  "rereply_outbound_enabled",
+  "rereply_inbound_enabled",
+  "rereply_integration_user_id"
  ],
  "fields": [
   {
@@ -108,12 +119,78 @@
    "fieldname": "allow_auto_read_receipt",
    "fieldtype": "Check",
    "label": "Allow auto read receipt"
+  },
+  {
+   "fieldname": "rereply_section",
+   "fieldtype": "Section Break",
+   "label": "Message Transport"
+  },
+  {
+   "fieldname": "transport_provider",
+   "fieldtype": "Select",
+   "label": "Transport Provider",
+   "options": "Meta\nReReply",
+   "default": "Meta"
+  },
+  {
+   "fieldname": "rereply_base_url",
+   "fieldtype": "Data",
+   "label": "ReReply URL",
+   "default": "https://app.rereply.app"
+  },
+  {
+   "fieldname": "rereply_workspace_id",
+   "fieldtype": "Data",
+   "label": "ReReply Workspace ID"
+  },
+  {
+   "fieldname": "rereply_account_id",
+   "fieldtype": "Data",
+   "label": "ReReply WhatsApp Account ID"
+  },
+  {
+   "fieldname": "rereply_account_name",
+   "fieldtype": "Data",
+   "label": "ReReply WhatsApp Account Name",
+   "length": 255
+  },
+  {
+   "fieldname": "rereply_api_key",
+   "fieldtype": "Password",
+   "label": "ReReply API Key",
+   "length": 300
+  },
+  {
+   "fieldname": "rereply_webhook_secret",
+   "fieldtype": "Password",
+   "label": "ReReply Webhook Secret",
+   "length": 300
+  },
+  {
+   "fieldname": "rereply_outbound_enabled",
+   "fieldtype": "Check",
+   "label": "Enable ReReply Sending",
+   "default": "0",
+   "description": "Sends committed queued messages. Unknown outcomes are held for review, never retried automatically."
+  },
+  {
+   "fieldname": "rereply_inbound_enabled",
+   "fieldtype": "Check",
+   "label": "Enable ReReply Incoming Messages",
+   "default": "0",
+   "description": "New incoming messages can trigger existing ERP bot and order scripts. Enable only after outbound validation."
+  },
+  {
+   "fieldname": "rereply_integration_user_id",
+   "fieldtype": "Data",
+   "label": "ReReply Integration User ID",
+   "description": "Dedicated API user UUID; distinguishes ERP replies from staff replies."
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-12-01 18:30:21.339317",
+ "modified": "2026-10-04 09:00:00.000000",
  "modified_by": "Administrator",
  "module": "Frappe Whatsapp",
  "name": "WhatsApp Account",

@@ -54,12 +54,27 @@ class WhatsAppMessage(Document):
     def before_insert(self):
         """Send message."""
         self.set_whatsapp_account()
+        if self.flags.rereply_prepared_payload:
+            from frappe_whatsapp.utils.rereply_queue import prepare_message
+            account = frappe.get_doc("WhatsApp Account", self.whatsapp_account)
+            prepare_message(self, account, self.flags.rereply_prepared_payload)
+            self.create_whatsapp_profile()
+            return
         # Route to template path when a template is selected,
         # since message_type is read_only and cannot be set from the UI.
         if self.template:
             self.message_type = "Template"
         self.send_outgoing()
         self.create_whatsapp_profile()
+
+    def after_insert(self):
+        from frappe_whatsapp.utils.rereply_queue import enqueue_message
+        enqueue_message(self)
+
+    def insert_rereply_notice(self, ignore_permissions=False):
+        """Internal server-script helper; not exposed as an HTTP method."""
+        from frappe_whatsapp.utils.rereply_queue import insert_rereply_notice
+        return insert_rereply_notice(self, ignore_permissions=ignore_permissions)
 
     def send_outgoing(self):
         """Dispatch an Outgoing message to Meta.
@@ -69,12 +84,12 @@ class WhatsAppMessage(Document):
         On non-template sends, raises and sets status to Failed on error;
         on template sends, `send_template` -> `notify` raises on error.
         """
-        if self.type != "Outgoing":
+        if self.type != "Outgoing" or self.flags.rereply_passive_log:
             return
 
         if self.message_type != "Template":
             if self.attach and not self.attach.startswith("http"):
-                link = frappe.utils.get_url() + "/" + self.attach
+                link = frappe.utils.get_url().rstrip("/") + "/" + self.attach.lstrip("/")
             else:
                 link = self.attach
 
@@ -187,7 +202,8 @@ class WhatsAppMessage(Document):
 
             try:
                 self.notify(data)
-                self.status = "Success"
+                if self.get("rereply_send_state") != "Queued":
+                    self.status = "Success"
             except Exception as e:
                 self.status = "Failed"
                 frappe.throw(f"Failed to send message {str(e)}")
@@ -344,6 +360,10 @@ class WhatsAppMessage(Document):
             "WhatsApp Account",
             self.whatsapp_account,
         )
+        from frappe_whatsapp.utils.rereply_queue import prepare_message, uses_rereply
+        if uses_rereply(whatsapp_account):
+            prepare_message(self, whatsapp_account, data)
+            return
         token = whatsapp_account.get_password("token")
 
         headers = {
@@ -390,6 +410,11 @@ class WhatsAppMessage(Document):
             "WhatsApp Account",
             self.whatsapp_account,
         )
+
+        if settings.get("transport_provider") == "ReReply":
+            # ReReply owns read acknowledgements; never call Meta with a
+            # synthetic ReReply UUID or the old ERP account token.
+            return {"managed_by": "ReReply"}
 
         token = settings.get_password("token")
 

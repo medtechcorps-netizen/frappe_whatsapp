@@ -265,10 +265,15 @@ class TestBulkMessagingUtils(IntegrationTestCase):
             frappe.db.get_value("Bulk WhatsApp Message", doc.name, "status"),
             "Scheduled",
         )
+        # The campaign is identified by the explicit log title. Newer Frappe
+        # omits traceback locals outside developer mode, so do not rely on them.
         self.assertTrue(
             frappe.get_all(
                 "Error Log",
-                filters={"error": ["like", f"%{doc.name}%"]},
+                filters={
+                    "method": f"Bulk WhatsApp Message scheduling failed: {doc.name}",
+                    "error": ["like", "%enqueue blew up%"],
+                },
                 limit=1,
             ),
             "failure was swallowed without an Error Log entry",

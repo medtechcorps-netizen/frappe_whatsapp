@@ -42,7 +42,19 @@
   "reference_doctype",
   "bulk_message_reference",
   "column_break_efrb",
-  "reference_name"
+  "reference_name",
+  "rereply_section",
+  "rereply_message_id",
+  "rereply_contact_id",
+  "rereply_source",
+  "rereply_send_state",
+  "rereply_payload",
+  "rereply_error",
+  "rereply_requested_by",
+  "rereply_route_key",
+  "rereply_status_checked_at",
+  "rereply_after_send",
+  "rereply_notice_key"
  ],
  "fields": [
   {
@@ -276,11 +288,93 @@
    "fieldtype": "JSON",
    "label": "Product Catalog",
    "set_only_once": 1
+  },
+  {
+   "fieldname": "rereply_section",
+   "fieldtype": "Section Break",
+   "label": "ReReply Delivery",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "rereply_message_id",
+   "fieldtype": "Data",
+   "label": "ReReply Message ID",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "rereply_contact_id",
+   "fieldtype": "Data",
+   "label": "ReReply Contact ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rereply_source",
+   "fieldtype": "Data",
+   "label": "ReReply Source",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rereply_send_state",
+   "fieldtype": "Select",
+   "label": "ReReply Send State",
+   "read_only": 1,
+   "options": "\nQueued\nSending\nSent\nFailed\nUnknown",
+   "search_index": 1
+  },
+  {
+   "fieldname": "rereply_payload",
+   "fieldtype": "Long Text",
+   "label": "Queued ReReply Payload",
+   "read_only": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "rereply_error",
+   "fieldtype": "Small Text",
+   "label": "ReReply Delivery Error",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rereply_requested_by",
+   "fieldtype": "Link",
+   "label": "ReReply Requested By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rereply_route_key",
+   "fieldtype": "Data",
+   "label": "ReReply Route Key",
+   "read_only": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "rereply_status_checked_at",
+   "fieldtype": "Datetime",
+   "label": "ReReply Status Checked At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rereply_after_send",
+   "fieldtype": "Long Text",
+   "label": "ReReply After Send Update",
+   "read_only": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "rereply_notice_key",
+   "fieldtype": "Data",
+   "label": "ReReply Business Notice Key",
+   "read_only": 1,
+   "hidden": 1,
+   "no_copy": 1,
+   "unique": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-02-11 00:34:02.455955",
+ "modified": "2026-10-04 09:00:00.000000",
  "modified_by": "Administrator",
  "module": "Frappe Whatsapp",
  "name": "WhatsApp Message",

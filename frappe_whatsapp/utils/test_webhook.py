@@ -8,10 +8,12 @@ import frappe
 from frappe_whatsapp.testing import IntegrationTestCase
 
 from frappe_whatsapp.utils.webhook import (
+    _message_sender_id,
     update_message_status,
     update_status,
     update_template_status,
 )
+from frappe_whatsapp.utils.webhook_security import meta_signature, verify_meta_signature
 
 
 class TestWebhookHelpers(IntegrationTestCase):
@@ -66,6 +68,16 @@ class TestWebhookHelpers(IntegrationTestCase):
         }
         # Should not raise
         update_status(data)
+
+    def test_message_sender_id_prefers_from_and_falls_back_to_from_user_id(self):
+        self.assertEqual(
+            _message_sender_id({"from": "919900112200", "from_user_id": "user_1"}),
+            "919900112200",
+        )
+        self.assertEqual(
+            _message_sender_id({"from": "  ", "from_user_id": " user_1 "}),
+            "user_1",
+        )
 
     def test_update_message_status(self):
         """Test update_message_status updates WhatsApp Message status."""
@@ -155,6 +167,8 @@ class TestWebhookHelpers(IntegrationTestCase):
 class TestWebhookEndpoint(IntegrationTestCase):
     """Tests for the webhook endpoint."""
 
+    EP_APP_SECRET = "test_webhook_ep_app_secret"
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -175,12 +189,21 @@ class TestWebhookEndpoint(IntegrationTestCase):
             account.insert(ignore_permissions=True)
             from frappe.utils.password import set_encrypted_password
             set_encrypted_password("WhatsApp Account", account.name, "ep_token", "token")
+            set_encrypted_password(
+                "WhatsApp Account", account.name, cls.EP_APP_SECRET, "app_secret"
+            )
             frappe.db.commit()  # nosemgrep: frappe-manual-commit -- test fixture must be visible to later queries
 
     def setUp(self):
         # Set password within each test's transaction scope
         from frappe.utils.password import set_encrypted_password
         set_encrypted_password("WhatsApp Account", "Test WA Webhook EP Account", "ep_token", "token")
+        set_encrypted_password(
+            "WhatsApp Account",
+            "Test WA Webhook EP Account",
+            self.EP_APP_SECRET,
+            "app_secret",
+        )
         # Clear ALL defaults then set ours (db.set_value bypasses on_update hooks)
         frappe.db.sql("UPDATE `tabWhatsApp Account` SET is_default_outgoing=0, is_default_incoming=0")
         frappe.db.set_value("WhatsApp Account", "Test WA Webhook EP Account", {
@@ -197,10 +220,19 @@ class TestWebhookEndpoint(IntegrationTestCase):
             frappe.delete_doc("WhatsApp Profiles", name, force=True)
         frappe.db.commit()  # nosemgrep: frappe-manual-commit -- test fixture must be visible to later queries
 
-    def _make_mock_request(self, method="GET"):
+    def _make_mock_request(self, method="GET", payload=None):
         """Create a mock request object."""
         mock_request = MagicMock()
         mock_request.method = method
+        mock_request.headers = {}
+        if payload is not None:
+            raw_body = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            mock_request.get_data.return_value = raw_body
+            mock_request.headers["X-Hub-Signature-256"] = meta_signature(
+                self.EP_APP_SECRET, raw_body
+            )
         return mock_request
 
     def test_webhook_get_verification(self):
@@ -232,7 +264,6 @@ class TestWebhookEndpoint(IntegrationTestCase):
 
     def test_webhook_post_text_message(self):
         """Test POST webhook with incoming text message."""
-        mock_request = self._make_mock_request("POST")
         payload = {
             "entry": [{
                 "changes": [{
@@ -249,6 +280,7 @@ class TestWebhookEndpoint(IntegrationTestCase):
                 }]
             }]
         }
+        mock_request = self._make_mock_request("POST", payload)
         frappe.local.form_dict = frappe._dict(payload)
 
         with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
@@ -263,9 +295,335 @@ class TestWebhookEndpoint(IntegrationTestCase):
         self.assertEqual(msg.message, "Hello from webhook test")
         self.assertEqual(msg.content_type, "text")
 
+    def test_webhook_post_text_message_with_business_scoped_user_id(self):
+        """Username-era payloads use from_user_id when from is empty."""
+        sender_id = "919900112276_user_id"
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "webhook_ep_phone_id"},
+                        "contacts": [{
+                            "profile": {"name": "User ID Sender"},
+                            "wa_id": "",
+                            "user_id": sender_id,
+                            "username": "user.id.sender",
+                        }],
+                        "messages": [{
+                            "from": "",
+                            "from_user_id": sender_id,
+                            "id": "wamid.webhook_ep_from_user_id",
+                            "type": "text",
+                            "text": {"body": "Hello from a username account"},
+                        }],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        frappe.local.form_dict = frappe._dict(payload)
+
+        with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
+            from frappe_whatsapp.utils.webhook import webhook
+            webhook()
+
+        msg = frappe.get_doc(
+            "WhatsApp Message", {"message_id": "wamid.webhook_ep_from_user_id"}
+        )
+        self.assertEqual(msg.get("from"), sender_id)
+        self.assertEqual(msg.profile_name, "User ID Sender")
+        profile = frappe.get_doc("WhatsApp Profiles", {"number": sender_id})
+        self.assertEqual(profile.profile_name, "User ID Sender")
+
+    def test_webhook_logs_bad_message_and_keeps_authenticated_batch(self):
+        """One bad envelope must not erase the raw log or later valid messages."""
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "webhook_ep_phone_id"},
+                        "contacts": [{
+                            "profile": {"name": "Valid Sender"},
+                            "wa_id": "919900112275",
+                        }],
+                        "messages": [
+                            {
+                                "id": "wamid.webhook_ep_bad_envelope",
+                                "type": "text",
+                                "text": {"body": "Missing sender"},
+                            },
+                            {
+                                "from": "919900112275",
+                                "id": "wamid.webhook_ep_after_bad_envelope",
+                                "type": "text",
+                                "text": {"body": "Still process this message"},
+                            },
+                        ],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        frappe.local.form_dict = frappe._dict(payload)
+        log_count = frappe.db.count(
+            "WhatsApp Notification Log", filters={"template": "Webhook"}
+        )
+
+        with (
+            patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request),
+            patch("frappe_whatsapp.utils.webhook.frappe.log_error") as log_error,
+        ):
+            from frappe_whatsapp.utils.webhook import webhook
+            webhook()
+
+        self.assertEqual(
+            frappe.db.count(
+                "WhatsApp Notification Log", filters={"template": "Webhook"}
+            ),
+            log_count + 1,
+        )
+        self.assertFalse(
+            frappe.db.exists(
+                "WhatsApp Message", {"message_id": "wamid.webhook_ep_bad_envelope"}
+            )
+        )
+        self.assertTrue(
+            frappe.db.exists(
+                "WhatsApp Message",
+                {"message_id": "wamid.webhook_ep_after_bad_envelope"},
+            )
+        )
+        log_error.assert_called_once()
+        error_message = log_error.call_args.kwargs["message"]
+        self.assertIn("wamid.webhook_ep_bad_envelope", error_message)
+        self.assertIn("_MessageEnvelopeError", error_message)
+
+    def test_webhook_rejects_invalid_signature_before_writes(self):
+        """An invalid signature must not create a log or message."""
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "webhook_ep_phone_id"},
+                        "contacts": [{"profile": {"name": "Forged Sender"}}],
+                        "messages": [{
+                            "from": "919900112280",
+                            "id": "wamid.webhook_ep_invalid_signature",
+                            "type": "text",
+                            "text": {"body": "This must not be stored"},
+                        }],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        mock_request.headers["X-Hub-Signature-256"] = "sha256=" + ("0" * 64)
+        log_count = frappe.db.count(
+            "WhatsApp Notification Log", filters={"template": "Webhook"}
+        )
+
+        with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
+            from frappe_whatsapp.utils.webhook import webhook
+            with self.assertRaises(frappe.AuthenticationError):
+                webhook()
+
+        self.assertFalse(
+            frappe.db.exists(
+                "WhatsApp Message",
+                {"message_id": "wamid.webhook_ep_invalid_signature"},
+            )
+        )
+        self.assertEqual(
+            log_count,
+            frappe.db.count(
+                "WhatsApp Notification Log", filters={"template": "Webhook"}
+            ),
+        )
+
+    def test_webhook_rejects_missing_signature_before_writes(self):
+        """A missing signature must fail exactly like an invalid signature."""
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "webhook_ep_phone_id"},
+                        "messages": [{
+                            "from": "919900112279",
+                            "id": "wamid.webhook_ep_missing_signature",
+                            "type": "text",
+                            "text": {"body": "This must not be stored"},
+                        }],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        mock_request.headers.pop("X-Hub-Signature-256")
+        log_count = frappe.db.count(
+            "WhatsApp Notification Log", filters={"template": "Webhook"}
+        )
+
+        with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
+            from frappe_whatsapp.utils.webhook import webhook
+            with self.assertRaises(frappe.AuthenticationError):
+                webhook()
+
+        self.assertFalse(
+            frappe.db.exists(
+                "WhatsApp Message",
+                {"message_id": "wamid.webhook_ep_missing_signature"},
+            )
+        )
+        self.assertEqual(
+            log_count,
+            frappe.db.count(
+                "WhatsApp Notification Log", filters={"template": "Webhook"}
+            ),
+        )
+
+    def test_webhook_rejects_unknown_account_before_writes(self):
+        """A valid HMAC cannot authorize routing metadata for an unknown account."""
+        payload = {
+            "entry": [{
+                "id": "unknown_business_id",
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "unknown_phone_id"},
+                        "messages": [{
+                            "from": "919900112278",
+                            "id": "wamid.webhook_ep_unknown_account",
+                            "type": "text",
+                            "text": {"body": "This must not be stored"},
+                        }],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        log_count = frappe.db.count(
+            "WhatsApp Notification Log", filters={"template": "Webhook"}
+        )
+
+        with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
+            from frappe_whatsapp.utils.webhook import webhook
+            with self.assertRaises(frappe.AuthenticationError):
+                webhook()
+
+        self.assertFalse(
+            frappe.db.exists(
+                "WhatsApp Message",
+                {"message_id": "wamid.webhook_ep_unknown_account"},
+            )
+        )
+        self.assertEqual(
+            log_count,
+            frappe.db.count(
+                "WhatsApp Notification Log", filters={"template": "Webhook"}
+            ),
+        )
+
+    def test_webhook_rejects_account_without_app_secret(self):
+        """Signature enforcement must fail closed when the routed secret is absent."""
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "webhook_ep_phone_id"},
+                        "messages": [{
+                            "from": "919900112277",
+                            "id": "wamid.webhook_ep_missing_secret",
+                            "type": "text",
+                            "text": {"body": "This must not be stored"},
+                        }],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        account_without_secret = MagicMock()
+        account_without_secret.get_password.return_value = None
+        log_count = frappe.db.count(
+            "WhatsApp Notification Log", filters={"template": "Webhook"}
+        )
+
+        with (
+            patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request),
+            patch(
+                "frappe_whatsapp.utils.webhook.frappe.get_doc",
+                return_value=account_without_secret,
+            ),
+        ):
+            from frappe_whatsapp.utils.webhook import webhook
+            with self.assertRaises(frappe.AuthenticationError):
+                webhook()
+
+        self.assertFalse(
+            frappe.db.exists(
+                "WhatsApp Message",
+                {"message_id": "wamid.webhook_ep_missing_secret"},
+            )
+        )
+        self.assertEqual(
+            log_count,
+            frappe.db.count(
+                "WhatsApp Notification Log", filters={"template": "Webhook"}
+            ),
+        )
+
+    def test_signature_helper_rejects_missing_or_malformed_inputs(self):
+        """The low-level verifier must fail closed for every absent input."""
+        raw_body = b'{"entry":[]}'
+        valid_signature = meta_signature(self.EP_APP_SECRET, raw_body)
+
+        self.assertFalse(verify_meta_signature("", raw_body, valid_signature))
+        self.assertFalse(
+            verify_meta_signature(self.EP_APP_SECRET, raw_body, "")
+        )
+        self.assertFalse(
+            verify_meta_signature(
+                self.EP_APP_SECRET,
+                raw_body,
+                "sha256=not-a-valid-sha256-digest",
+            )
+        )
+        self.assertFalse(
+            verify_meta_signature(self.EP_APP_SECRET, "not-bytes", valid_signature)
+        )
+
+    def test_webhook_signature_is_bound_to_exact_raw_bytes(self):
+        """Semantically equal JSON with different bytes must need a new signature."""
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {"phone_number_id": "webhook_ep_phone_id"},
+                        "messages": [{
+                            "from": "919900112281",
+                            "id": "wamid.webhook_ep_tampered_bytes",
+                            "type": "text",
+                            "text": {"body": "Signed body"},
+                        }],
+                    }
+                }]
+            }]
+        }
+        mock_request = self._make_mock_request("POST", payload)
+        mock_request.get_data.return_value += b"\n"
+
+        with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
+            from frappe_whatsapp.utils.webhook import webhook
+            with self.assertRaises(frappe.AuthenticationError):
+                webhook()
+
+        self.assertFalse(
+            frappe.db.exists(
+                "WhatsApp Message",
+                {"message_id": "wamid.webhook_ep_tampered_bytes"},
+            )
+        )
+
     def test_webhook_post_reaction_message(self):
         """Test POST webhook with reaction message."""
-        mock_request = self._make_mock_request("POST")
         payload = {
             "entry": [{
                 "changes": [{
@@ -285,6 +643,7 @@ class TestWebhookEndpoint(IntegrationTestCase):
                 }]
             }]
         }
+        mock_request = self._make_mock_request("POST", payload)
         frappe.local.form_dict = frappe._dict(payload)
 
         with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
@@ -300,7 +659,6 @@ class TestWebhookEndpoint(IntegrationTestCase):
 
     def test_webhook_post_button_message(self):
         """Test POST webhook with button reply message."""
-        mock_request = self._make_mock_request("POST")
         payload = {
             "entry": [{
                 "changes": [{
@@ -317,6 +675,7 @@ class TestWebhookEndpoint(IntegrationTestCase):
                 }]
             }]
         }
+        mock_request = self._make_mock_request("POST", payload)
         frappe.local.form_dict = frappe._dict(payload)
 
         with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
@@ -329,7 +688,6 @@ class TestWebhookEndpoint(IntegrationTestCase):
 
     def test_webhook_post_reply_message(self):
         """Test POST webhook with reply context."""
-        mock_request = self._make_mock_request("POST")
         payload = {
             "entry": [{
                 "changes": [{
@@ -347,6 +705,7 @@ class TestWebhookEndpoint(IntegrationTestCase):
                 }]
             }]
         }
+        mock_request = self._make_mock_request("POST", payload)
         frappe.local.form_dict = frappe._dict(payload)
 
         with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
@@ -373,7 +732,6 @@ class TestWebhookEndpoint(IntegrationTestCase):
         msg.db_insert()
         frappe.db.commit()  # nosemgrep: frappe-manual-commit -- test fixture must be visible to later queries
 
-        mock_request = self._make_mock_request("POST")
         payload = {
             "entry": [{
                 "changes": [{
@@ -389,6 +747,7 @@ class TestWebhookEndpoint(IntegrationTestCase):
                 }]
             }]
         }
+        mock_request = self._make_mock_request("POST", payload)
         frappe.local.form_dict = frappe._dict(payload)
 
         with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
@@ -426,9 +785,9 @@ class TestWebhookEndpoint(IntegrationTestCase):
             doc.db_insert()
         frappe.db.commit()  # nosemgrep: frappe-manual-commit -- test fixture must be visible to later queries
 
-        mock_request = self._make_mock_request("POST")
         payload = {
             "entry": [{
+                "id": "webhook_ep_business_id",
                 "changes": [{
                     "field": "message_template_status_update",
                     "value": {
@@ -441,6 +800,7 @@ class TestWebhookEndpoint(IntegrationTestCase):
                 }],
             }],
         }
+        mock_request = self._make_mock_request("POST", payload)
         frappe.local.form_dict = frappe._dict(payload)
 
         with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
@@ -454,7 +814,6 @@ class TestWebhookEndpoint(IntegrationTestCase):
 
     def test_webhook_creates_notification_log(self):
         """Test that webhook POST creates a notification log entry."""
-        mock_request = self._make_mock_request("POST")
         payload = {
             "entry": [{
                 "changes": [{
@@ -471,6 +830,7 @@ class TestWebhookEndpoint(IntegrationTestCase):
                 }]
             }]
         }
+        mock_request = self._make_mock_request("POST", payload)
         frappe.local.form_dict = frappe._dict(payload)
 
         with patch("frappe_whatsapp.utils.webhook.frappe.request", mock_request):
