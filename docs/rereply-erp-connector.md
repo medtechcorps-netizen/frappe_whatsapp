@@ -13,7 +13,7 @@ retain their previous transport.
    workspace. Use its API key, not a shared administrator key. Grant only the
    contact, chat, account and template access required by the endpoints below.
 3. On the existing ERP WhatsApp Account, select ReReply. Set its HTTPS origin,
-   workspace UUID, WhatsApp account UUID, exact account display name and dedicated
+   workspace UUID, WhatsApp account UUID, exact API `account.name` and dedicated
    integration user UUID. Update the phone-number ID and WABA ID to the new
    Coexistence account. Store the API key in the Password field.
 4. Generate a dedicated webhook signing secret of at least 32 characters. It
@@ -36,6 +36,11 @@ retain their previous transport.
    enabling ERP inbound automation. Keep competing ReReply automatic responders
    off for this account. Enable incoming processing and the outbound webhook
    only after the outbound queue, identifiers and template mapping are verified.
+   Inspect all queued rows before enabling sending: the scheduler releases every
+   queued row for an enabled account, including rows created while its gate was
+   off. Hold pre-cutover customer messages for reconciliation and pause their
+   producing jobs during controlled validation. Confirm the short worker and
+   scheduler are running after the migration.
 
 Do not deregister the number, call the ordinary phone registration action, or
 point the shared Meta app webhook back to ERPNext.
