@@ -17,6 +17,12 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
 
     def validate(self):
         self.set_whatsapp_account()
+        account = frappe.get_doc("WhatsApp Account", self.whatsapp_account)
+        if account.get("transport_provider") == "ReReply":
+            # ReReply owns the provider template. Saving here only verifies and
+            # mirrors it; do this before any legacy media upload or Meta update.
+            self.sync_from_rereply(account)
+            return
         if not self.language_code or self.has_value_changed("language"):
             lang_code = frappe.db.get_value("Language", self.language) or "en"
             self.language_code = lang_code.replace("-", "_")
@@ -27,6 +33,39 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
 
         if not self.is_new():
             self.update_template()
+
+    def sync_from_rereply(self, account=None):
+        """Mirror a verified ReReply template without publishing local edits."""
+        from frappe_whatsapp.utils.rereply_client import ReReplyError, get_template_details
+
+        account = account or frappe.get_doc("WhatsApp Account", self.whatsapp_account)
+        if account.get("transport_provider") != "ReReply" or account.get("status") != "Active":
+            frappe.throw("An active ReReply WhatsApp Account is required to mirror this template.")
+        language = frappe.db.get_value("Language", self.language, "language_code") or self.language
+        language = (language or "").replace("-", "_")
+        name = self.actual_name or (self.template_name or "").lower().replace(" ", "_")
+        try:
+            remote = get_template_details(account, name, language)
+            fields = _rereply_template_fields(remote)
+        except ReReplyError as error:
+            frappe.throw(str(error))
+        if self.template != fields["template"]:
+            frappe.throw("ERP template body must exactly match ReReply. Edit and publish the template in ReReply first.")
+        local_buttons = [_template_button_signature(button) for button in self.get("buttons") or []]
+        remote_buttons = [_template_button_signature(button) for button in fields["buttons"]]
+        if (
+            (self.header_type or "") != fields["header_type"]
+            or (self.header or "") != fields["header"]
+            or (self.footer or "") != fields["footer"]
+            or local_buttons != remote_buttons
+        ):
+            frappe.throw("ERP template header, footer and buttons must exactly match ReReply.")
+        # Normal insert/save persists these verified values. Preserve ERP field
+        # mappings and samples; the provider may omit examples after Meta sync.
+        for field in ("template", "header_type", "header", "footer", "category", "status", "id"):
+            self.set(field, fields[field])
+        self.actual_name = remote["name"]
+        self.language_code = remote["language"]
 
     def set_whatsapp_account(self):
         """Set whatsapp account to default if missing"""
@@ -121,6 +160,8 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
 
 
     def after_insert(self):  # nosemgrep: frappe-modifying-but-not-committing -- self.actual_name/id/status are persisted via self.db_update() after the Meta round-trip; the static check can't trace through the API call
+        if frappe.get_doc("WhatsApp Account", self.whatsapp_account).get("transport_provider") == "ReReply":
+            return  # validate already verified the mirror; never publish from ERP.
         # actual_name / id / status are persisted via self.db_update() below
         # after the Meta round-trip; the static check can't trace that call.
         if self.template_name:
@@ -193,6 +234,10 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
 
     def update_template(self):
         """Update template to meta."""
+        account = frappe.get_doc("WhatsApp Account", self.whatsapp_account)
+        if account.get("transport_provider") == "ReReply":
+            self.sync_from_rereply(account)
+            return
         self.get_settings()
         data = {"components": []}
 
@@ -253,6 +298,8 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
         # outbound HTTP call — they are not DocType fields and must not be
         # persisted. Semgrep's static check can't tell the difference.
         settings = frappe.get_doc("WhatsApp Account", self.whatsapp_account)
+        if settings.get("transport_provider") == "ReReply":
+            frappe.throw("Manage template publishing and media uploads in ReReply for this account.")
         self._token = settings.get_password("token")  # nosemgrep: frappe-modifying-but-not-committing-other-method
         self._url = settings.url  # nosemgrep: frappe-modifying-but-not-committing-other-method
         self._version = settings.version  # nosemgrep: frappe-modifying-but-not-committing-other-method
@@ -265,6 +312,8 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
         }
 
     def on_trash(self):
+        if frappe.get_doc("WhatsApp Account", self.whatsapp_account).get("transport_provider") == "ReReply":
+            return  # Delete only the local mirror, never the provider template.
         self.get_settings()
         url = f"{self._url}/{self._version}/{self._business_id}/message_templates?name={self.actual_name}"
         try:
@@ -299,13 +348,84 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
 
         return header
 
+
+def _template_button_signature(button):
+    return tuple(button.get(key) or "" for key in (
+        "button_type", "button_label", "website_url", "phone_number", "url_type",
+    ))
+
+
+def _rereply_template_fields(remote):
+    """Map only component formats this ERP schema can represent faithfully."""
+    from frappe_whatsapp.utils.rereply_client import ReReplyError
+
+    category = str(remote.get("category") or "").upper()
+    if category not in ("UTILITY", "MARKETING", "AUTHENTICATION"):
+        raise ReReplyError("ReReply returned an unsupported template category.")
+    header_type = str(remote.get("header_type") or "NONE").upper()
+    if header_type not in ("NONE", "TEXT", "IMAGE", "DOCUMENT"):
+        raise ReReplyError("This ReReply template header cannot be represented in ERP.")
+    buttons = remote.get("buttons") or []
+    if not isinstance(buttons, list):
+        raise ReReplyError("ReReply returned invalid template buttons.")
+    mapped = []
+    types = {"URL": "Visit Website", "PHONE_NUMBER": "Call Phone", "QUICK_REPLY": "Quick Reply"}
+    for button in buttons:
+        if not isinstance(button, dict) or button.get("type") not in types:
+            raise ReReplyError("This ReReply template button cannot be represented in ERP.")
+        value = {"button_type": types[button["type"]], "button_label": button.get("text") or ""}
+        if not value["button_label"]:
+            raise ReReplyError("ReReply returned a template button without its label.")
+        if button["type"] == "URL":
+            value["website_url"] = button.get("url") or ""
+            value["url_type"] = "Dynamic" if "{{" in value["website_url"] else "Static"
+            if not value["website_url"]:
+                raise ReReplyError("ReReply returned a template button without its URL.")
+        elif button["type"] == "PHONE_NUMBER":
+            value["phone_number"] = button.get("phone_number") or ""
+            if not value["phone_number"]:
+                raise ReReplyError("ReReply returned a template button without its phone number.")
+        mapped.append(value)
+    return {
+        "template": remote["body_content"], "category": category,
+        "status": remote["status"].upper(), "id": remote.get("meta_template_id") or "",
+        "header_type": "" if header_type == "NONE" else header_type,
+        "header": (remote.get("header_content") or "") if header_type == "TEXT" else "",
+        "footer": remote.get("footer_content") or "", "buttons": mapped,
+    }
+
 @frappe.whitelist()
-def fetch():
-    """Fetch templates from meta."""
-    """Later improve this code to pass a whatsapp account remove the js funcation so that it is called from whatsapp account doctype """
-    whatsapp_accounts = frappe.get_all('WhatsApp Account', filters={'status': 'Active'}, fields=['name', 'token', 'url', 'version', 'business_id'])
+def fetch(account_name=None, template_name=None):
+    """Refresh templates; optional template_name is an existing ERP document name."""
+    frappe.has_permission("WhatsApp Templates", "write", throw=True)
+    if template_name and not account_name:
+        frappe.throw("Select a WhatsApp Account for a targeted template refresh.")
+    selected_template = None
+    if account_name:
+        account_doc = frappe.get_doc("WhatsApp Account", account_name)
+        account_doc.check_permission("read")
+        if account_doc.status != "Active":
+            frappe.throw("Select an active WhatsApp Account.")
+    if template_name:
+        selected_template = frappe.get_doc("WhatsApp Templates", template_name)
+        selected_template.check_permission("write")
+        if selected_template.whatsapp_account != account_name:
+            frappe.throw("The selected ERP template belongs to a different WhatsApp Account.")
+    filters = {"status": "Active"}
+    if account_name:
+        filters["name"] = account_name
+    whatsapp_accounts = frappe.get_all('WhatsApp Account', filters=filters, fields=['name', 'token', 'url', 'version', 'business_id', 'transport_provider'])
 
     for account in whatsapp_accounts:
+        if account.get("transport_provider") == "ReReply":
+            # Refresh existing mirrors through the same verified GET-only path.
+            # New provider templates are created/published in ReReply first.
+            mirror_filters = {"whatsapp_account": account.name}
+            if template_name:
+                mirror_filters["name"] = template_name
+            for name in frappe.get_all("WhatsApp Templates", filters=mirror_filters, pluck="name"):
+                frappe.get_doc("WhatsApp Templates", name).save()
+            continue
         # get credentials
         token = frappe.get_doc("WhatsApp Account", account.name).get_password("token")
         url = account.url
@@ -322,10 +442,18 @@ def fetch():
             )
 
             for template in response["data"]:
+                if selected_template and (
+                    selected_template.actual_name != template["name"]
+                    or selected_template.language_code != template["language"]
+                ):
+                    continue
                 # set flag to insert or update
                 flags = 1
-                if frappe.db.exists("WhatsApp Templates", {"actual_name": template["name"]}):
-                    doc = frappe.get_doc("WhatsApp Templates", {"actual_name": template["name"]})
+                identity = {"actual_name": template["name"]}
+                if frappe.db.exists("WhatsApp Templates", identity):
+                    doc = frappe.get_doc("WhatsApp Templates", identity)
+                    if doc.whatsapp_account and frappe.get_doc("WhatsApp Account", doc.whatsapp_account).get("transport_provider") == "ReReply":
+                        frappe.throw("A Meta template fetch cannot replace a ReReply template mirror.")
                 else:
                     flags = 0
                     doc = frappe.new_doc("WhatsApp Templates")
@@ -422,6 +550,7 @@ def fetch():
             else:
                 # Handle cases where frappe.flags.integration_request doesn't exist or isn't a proper response object
                 frappe.throw(f"An unexpected server error occurred: {e}")
+    return "Successfully refreshed template mirrors"
 
 def upsert_doc_without_hooks(doc, child_dt, child_field):
     """Insert or update a parent document and its children without hooks."""

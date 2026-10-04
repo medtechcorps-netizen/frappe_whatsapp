@@ -1,0 +1,102 @@
+{
+ "doctype": "DocType",
+ "name": "ReReply Webhook Receipt",
+ "module": "Frappe Whatsapp",
+ "engine": "InnoDB",
+ "autoname": "hash",
+ "allow_rename": 0,
+ "creation": "2026-10-04 09:00:00.000000",
+ "modified": "2026-10-04 09:00:00.000000",
+ "field_order": [
+  "event_key",
+  "event_id",
+  "provider_message_id",
+  "whatsapp_account",
+  "workspace_id",
+  "provider_account_id",
+  "event_type",
+  "payload_hash",
+  "status",
+  "whatsapp_message",
+  "error",
+  "payload"
+ ],
+ "fields": [
+  {
+   "fieldname": "event_key",
+   "fieldtype": "Data",
+   "label": "Event Key",
+   "unique": 1
+  },
+  {
+   "fieldname": "event_id",
+   "fieldtype": "Data",
+   "label": "Event ID"
+  },
+  {
+   "fieldname": "provider_message_id",
+   "fieldtype": "Data",
+   "label": "Provider Message ID"
+  },
+  {
+   "fieldname": "whatsapp_account",
+   "fieldtype": "Link",
+   "label": "WhatsApp Account",
+   "options": "WhatsApp Account"
+  },
+  {
+   "fieldname": "workspace_id",
+   "fieldtype": "Data",
+   "label": "Workspace ID"
+  },
+  {
+   "fieldname": "provider_account_id",
+   "fieldtype": "Data",
+   "label": "Provider Account ID"
+  },
+  {
+   "fieldname": "event_type",
+   "fieldtype": "Data",
+   "label": "Event Type"
+  },
+  {
+   "fieldname": "payload_hash",
+   "fieldtype": "Data",
+   "label": "Payload Hash"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Pending\nProcessing\nProcessed\nIgnored\nFailed",
+   "search_index": 1
+  },
+  {
+   "fieldname": "whatsapp_message",
+   "fieldtype": "Link",
+   "label": "WhatsApp Message",
+   "options": "WhatsApp Message"
+  },
+  {
+   "fieldname": "error",
+   "fieldtype": "Small Text",
+   "label": "Processing Error"
+  },
+  {
+   "fieldname": "payload",
+   "fieldtype": "Long Text",
+   "label": "Verified Event Payload",
+   "hidden": 1
+  }
+ ],
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "report": 1
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "track_changes": 0
+}

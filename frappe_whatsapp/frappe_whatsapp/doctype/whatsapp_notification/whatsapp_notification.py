@@ -177,7 +177,8 @@ class WhatsAppNotification(Document):
                     if not file_url.startswith("http"):
                         # get share key so that private files can be sent
                         key = doc.get_document_share_key()
-                        file_url = f'{frappe.utils.get_url()}{file_url}&key={key}'
+                        separator = '&' if '?' in file_url else '?'
+                        file_url = f'{frappe.utils.get_url()}{file_url}{separator}key={key}'
                 else:
                     file_url = self.attach
 
@@ -257,6 +258,9 @@ class WhatsAppNotification(Document):
 
         if not whatsapp_account:
             frappe.throw(_("Please set a default outgoing WhatsApp Account"))
+
+        if whatsapp_account.get("transport_provider") == "ReReply":
+            return self.queue_rereply_notification(whatsapp_account, data, doc_data)
 
         token = whatsapp_account.get_password("token")
 
@@ -339,6 +343,38 @@ class WhatsAppNotification(Document):
                 "meta_data": meta
             }).insert(ignore_permissions=True)
 
+
+    def queue_rereply_notification(self, account, data, doc_data=None):
+        """Persist one outbound row using the already-rendered template."""
+        new_doc = frappe.get_doc({
+            "doctype": "WhatsApp Message", "type": "Outgoing",
+            "message": str(data["template"]), "to": data["to"],
+            "message_type": "Template", "content_type": self.get("content_type") or "text",
+            "use_template": 1, "template": self.template, "whatsapp_account": account.name,
+        })
+        if doc_data:
+            new_doc.reference_doctype = doc_data.doctype
+            new_doc.reference_name = doc_data.name
+        new_doc.flags.rereply_prepared_payload = data
+        if doc_data and self.set_property_after_alert and self.property_value:
+            df = frappe.get_meta(doc_data.doctype).get_field(self.set_property_after_alert)
+            if df:
+                value = self.property_value
+                if df.fieldtype in frappe.model.numeric_fieldtypes:
+                    value = frappe.utils.cint(value)
+                new_doc.rereply_after_send = json.dumps({
+                    "doctype": doc_data.doctype, "name": doc_data.name,
+                    "fieldname": self.set_property_after_alert, "value": value,
+                }, default=str)
+        if new_doc.get("rereply_after_send"):
+            new_doc = new_doc.insert_rereply_notice(ignore_permissions=True)
+        else:
+            new_doc.insert(ignore_permissions=True)
+        frappe.get_doc({
+            "doctype": "WhatsApp Notification Log", "template": self.template,
+            "meta_data": {"transport": "ReReply", "status": new_doc.get("rereply_send_state") or "Queued", "message": new_doc.name},
+        }).insert(ignore_permissions=True)
+        return new_doc.name
 
     def on_trash(self):
         """On delete remove from schedule."""
