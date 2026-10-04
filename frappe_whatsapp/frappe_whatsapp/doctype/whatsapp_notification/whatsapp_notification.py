@@ -366,10 +366,13 @@ class WhatsAppNotification(Document):
                     "doctype": doc_data.doctype, "name": doc_data.name,
                     "fieldname": self.set_property_after_alert, "value": value,
                 }, default=str)
-        new_doc.insert(ignore_permissions=True)
+        if new_doc.get("rereply_after_send"):
+            new_doc = new_doc.insert_rereply_notice(ignore_permissions=True)
+        else:
+            new_doc.insert(ignore_permissions=True)
         frappe.get_doc({
             "doctype": "WhatsApp Notification Log", "template": self.template,
-            "meta_data": {"transport": "ReReply", "status": "Queued", "message": new_doc.name},
+            "meta_data": {"transport": "ReReply", "status": new_doc.get("rereply_send_state") or "Queued", "message": new_doc.name},
         }).insert(ignore_permissions=True)
         return new_doc.name
 

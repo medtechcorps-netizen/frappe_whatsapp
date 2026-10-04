@@ -54,6 +54,14 @@ commits a `Sending` claim before attempting the request. Concurrent workers cann
 send the same row. Provider acceptance records a distinct ReReply UUID and status;
 it does not prove customer delivery.
 
+Business notices with a deferred source-document flag reserve a unique key for
+the ERP account, source document, flag and value. Repeated document events return
+the existing message, including when it is queued, failed or uncertain. A
+definitive rejection must be retried on that same row; a new document event does
+not silently create another send. Ordinary chat messages do not share this key.
+Custom Server Scripts use `message.insert_rereply_notice(ignore_permissions=True)`
+after setting `rereply_after_send` and the matching document reference.
+
 An HTTP timeout, send 5xx, malformed success response, or process exit during a
 send becomes `Unknown`. There is no automatic resend. Reconcile the ReReply
 conversation before operator recovery. A definitive rejection may be retried

@@ -103,6 +103,139 @@ class TestReReplyIntegration(IntegrationTestCase):
             "wamid": "",
         }
 
+    def _notice(self, fieldname="allow_auto_read_receipt", value=1, **overrides):
+        """An event notice referencing only this test's own real ERP document."""
+        values = {
+            "doctype": "WhatsApp Message", "type": "Outgoing", "to": self.phone,
+            "message": "Business event notice", "message_type": "Manual", "content_type": "text",
+            "whatsapp_account": self.account.name,
+            "reference_doctype": "WhatsApp Account", "reference_name": self.account.name,
+            "rereply_after_send": json.dumps({
+                "doctype": "WhatsApp Account", "name": self.account.name,
+                "fieldname": fieldname, "value": value,
+            }),
+        }
+        values.update(overrides)
+        return frappe.get_doc(values)
+
+    def test_business_notice_repeated_event_returns_existing_in_every_delivery_state(self):
+        first = self._notice().insert_rereply_notice(ignore_permissions=True)
+        first_key = first.rereply_notice_key
+        first_payload = first.rereply_payload
+        self.assertTrue(first_key)
+        self.enqueue.reset_mock()
+        for state in ("Queued", "Sending", "Unknown", "Failed", "Sent"):
+            with self.subTest(state=state):
+                frappe.db.set_value("WhatsApp Message", first.name, {
+                    "rereply_send_state": state, "status": state,
+                })
+                with patch.object(frappe.db, "commit", side_effect=AssertionError("Notice insert must not commit")):
+                    duplicate = self._notice(message="Changed rendering of the same event").insert_rereply_notice(
+                        ignore_permissions=True
+                    )
+                self.assertEqual(duplicate.name, first.name)
+                self.assertEqual(duplicate.rereply_notice_key, first_key)
+                self.assertEqual(duplicate.rereply_send_state, state)
+                self.assertEqual(duplicate.rereply_payload, first_payload)
+        self.assertEqual(frappe.db.count("WhatsApp Message", {"rereply_notice_key": first_key}), 1)
+        self.enqueue.assert_not_called()
+
+    def test_different_business_notice_flag_or_value_creates_distinct_intent(self):
+        first = self._notice().insert_rereply_notice(ignore_permissions=True)
+        other_flag = self._notice(fieldname="is_default_incoming").insert_rereply_notice(ignore_permissions=True)
+        other_value = self._notice(value=0).insert_rereply_notice(ignore_permissions=True)
+        rows = (first, other_flag, other_value)
+        self.assertEqual(len({row.name for row in rows}), 3)
+        self.assertEqual(len({row.rereply_notice_key for row in rows}), 3)
+        self.assertEqual(self.enqueue.call_count, 3)
+
+    def test_notice_key_is_enforced_by_database_unique_constraint(self):
+        first = self._notice().insert_rereply_notice(ignore_permissions=True)
+        duplicate = self._notice()
+        duplicate.name = "notice-conflict-" + uuid4().hex
+        duplicate.rereply_notice_key = first.rereply_notice_key
+        savepoint = "notice_unique_" + self.suffix
+        frappe.db.savepoint(savepoint)
+        try:
+            # Bypass document hooks deliberately: this proves that the database,
+            # not only a prior application lookup, rejects a competing insert.
+            with self.assertRaises((frappe.UniqueValidationError, frappe.DuplicateEntryError)):
+                duplicate.db_insert()
+        finally:
+            frappe.db.rollback(save_point=savepoint)
+        self.assertEqual(frappe.db.count("WhatsApp Message", {"rereply_notice_key": first.rereply_notice_key}), 1)
+        self.assertTrue(frappe.db.exists("WhatsApp Message", first.name))
+
+    def test_notice_stale_precheck_recovers_winning_row_after_real_unique_error(self):
+        first = self._notice().insert_rereply_notice(ignore_permissions=True)
+        self.enqueue.reset_mock()
+        get_value = frappe.db.get_value
+        hidden_once = []
+
+        def stale_precheck(*args, **kwargs):
+            if (not hidden_once and len(args) >= 2 and args[0] == "WhatsApp Message"
+                    and args[1] == {"rereply_notice_key": first.rereply_notice_key}):
+                hidden_once.append(True)
+                return None
+            return get_value(*args, **kwargs)
+
+        with patch.object(frappe.db, "get_value", side_effect=stale_precheck), \
+                patch.object(frappe.db, "sql", wraps=frappe.db.sql) as sql:
+            # Simulate the optimistic lookup missing a competing winner. The
+            # ensuing INSERT and unique-constraint rejection still use real SQL.
+            result = self._notice().insert_rereply_notice(ignore_permissions=True)
+        self.assertEqual(hidden_once, [True])
+        self.assertEqual(result.name, first.name)
+        self.assertTrue(any("rereply_notice_key" in str(call.args[0])
+                            and "FOR UPDATE" in str(call.args[0])
+                            for call in sql.call_args_list if call.args))
+        self.assertEqual(frappe.db.count("WhatsApp Message", {"rereply_notice_key": first.rereply_notice_key}), 1)
+        self.enqueue.assert_not_called()
+
+    def test_notice_descriptor_cannot_update_a_different_source_document(self):
+        descriptor = {"doctype": "User", "name": "Administrator", "fieldname": "enabled", "value": 0}
+        with self.assertRaises(frappe.ValidationError):
+            self._notice(rereply_after_send=json.dumps(descriptor)).insert_rereply_notice(ignore_permissions=True)
+        self.assertEqual(frappe.db.count("WhatsApp Message", {"whatsapp_account": self.account.name}), 0)
+        self.enqueue.assert_not_called()
+
+    def test_notice_retry_reuses_original_key_and_row(self):
+        first = self._notice().insert_rereply_notice(ignore_permissions=True)
+        first_key = first.rereply_notice_key
+        with patch("frappe_whatsapp.utils.rereply_client.send_via_rereply",
+                   side_effect=ReReplyError("Preparation rejected before send")):
+            rereply_queue.send_queued_message(first.name)
+        first.reload()
+        self.assertEqual(first.rereply_send_state, "Failed")
+        duplicate = self._notice().insert_rereply_notice(ignore_permissions=True)
+        self.assertEqual(duplicate.name, first.name)
+        self.assertEqual(duplicate.rereply_send_state, "Failed")
+        with patch("frappe_whatsapp.utils.rereply_client.send_via_rereply", return_value=self._accepted()) as send:
+            self.assertTrue(rereply_queue.retry_rejected_message(first.name))
+            self.assertFalse(rereply_queue.retry_rejected_message(first.name))
+        send.assert_called_once()
+        first.reload()
+        self.assertEqual(first.rereply_notice_key, first_key)
+        self.assertEqual(self._notice().insert_rereply_notice(ignore_permissions=True).name, first.name)
+        self.assertEqual(frappe.db.count("WhatsApp Message", {"rereply_notice_key": first_key}), 1)
+
+    def test_ordinary_repeated_messages_are_not_business_notice_deduplicated(self):
+        reference = {"reference_doctype": "WhatsApp Account", "reference_name": self.account.name}
+        first = self._message(**reference)
+        second = self._message(**reference)
+        self.assertNotEqual(first.name, second.name)
+        self.assertFalse(first.rereply_notice_key)
+        self.assertFalse(second.rereply_notice_key)
+        self.assertEqual(self.enqueue.call_count, 2)
+
+    def test_inbound_enable_requires_integration_user_identity(self):
+        self.account.rereply_inbound_enabled = 1
+        self.account.rereply_webhook_secret = uuid4().hex + uuid4().hex
+        self.account.rereply_integration_user_id = None
+        with self.assertRaisesRegex(frappe.ValidationError, "integration user ID is required"):
+            self.account.save(ignore_permissions=True)
+        self.assertFalse(frappe.db.get_value("WhatsApp Account", self.account.name, "rereply_inbound_enabled"))
+
     def test_insert_stages_one_message_without_sending_or_committing(self):
         with patch.object(frappe.db, "commit", side_effect=AssertionError("A document hook must not commit")), \
                 patch("frappe_whatsapp.utils.rereply_client.send_via_rereply") as send:
@@ -207,7 +340,7 @@ class TestReReplyIntegration(IntegrationTestCase):
             self.assertFalse(rereply_queue.retry_rejected_message(message.name))
         send.assert_called_once()
 
-    def test_notification_uses_rendered_payload_and_creates_one_row(self):
+    def _notification_fixture(self, **overrides):
         template_name = "rereply_notification_" + self.suffix
         template = frappe.get_doc({
             "doctype": "WhatsApp Templates", "name": template_name + "-en",
@@ -218,16 +351,22 @@ class TestReReplyIntegration(IntegrationTestCase):
         })
         template.db_insert()  # A provider-approved template fixture; never call Meta template creation.
         self.template_names.append(template.name)
-        notification = frappe.get_doc({
+        notification_data = {
             "doctype": "WhatsApp Notification", "notification_name": "Test " + self.suffix,
             "whatsapp_account": self.account.name, "template": template.name,
             "content_type": "text",
-        })
+        }
+        notification_data.update(overrides)
+        notification = frappe.get_doc(notification_data)
         payload = {
             "messaging_product": "whatsapp", "to": self.phone, "type": "template",
             "template": {"name": template_name, "language": {"code": "en"},
                          "components": [{"type": "body", "parameters": [{"type": "text", "text": "Rendered value"}]}]},
         }
+        return notification, payload
+
+    def test_notification_uses_rendered_payload_and_creates_one_row(self):
+        notification, payload = self._notification_fixture()
         with patch("frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_message.whatsapp_message.WhatsAppMessage.send_template",
                    side_effect=AssertionError("Do not render/send a notification twice")), \
                 patch.object(frappe.db, "commit", side_effect=AssertionError("Notification hooks must not commit")):
@@ -235,6 +374,24 @@ class TestReReplyIntegration(IntegrationTestCase):
         rows = frappe.get_all("WhatsApp Message", filters={"whatsapp_account": self.account.name}, pluck="name")
         self.assertEqual(rows, [message_name])
         self.assertEqual(json.loads(frappe.db.get_value("WhatsApp Message", message_name, "rereply_payload")), payload)
+        self.enqueue.assert_called_once()
+
+    def test_notification_flag_repeated_before_delivery_reuses_single_intent(self):
+        notification, payload = self._notification_fixture(
+            set_property_after_alert="allow_auto_read_receipt", property_value="1"
+        )
+        frappe.db.set_value("WhatsApp Account", self.account.name, "allow_auto_read_receipt", 0)
+        self.account.reload()
+        reference = self.account.as_dict()
+        first_name = notification.notify(payload, reference)
+        self.assertEqual(notification.notify(payload, reference), first_name)
+        self.assertEqual(frappe.db.get_value("WhatsApp Account", self.account.name, "allow_auto_read_receipt"), 0)
+        for state in ("Unknown", "Failed"):
+            frappe.db.set_value("WhatsApp Message", first_name, {"rereply_send_state": state, "status": state})
+            self.assertEqual(notification.notify(payload, reference), first_name)
+        rows = frappe.get_all("WhatsApp Message", filters={"whatsapp_account": self.account.name}, pluck="name")
+        self.assertEqual(rows, [first_name])
+        self.assertTrue(frappe.db.get_value("WhatsApp Message", first_name, "rereply_notice_key"))
         self.enqueue.assert_called_once()
 
     def test_passive_outgoing_log_never_queues_delivery(self):

@@ -6,6 +6,8 @@ document hooks or inside the ERP transaction creating an order/message.
 """
 import json
 import hashlib
+import re
+from uuid import uuid4
 
 import frappe
 from frappe.utils import add_to_date, now_datetime
@@ -20,6 +22,78 @@ def route_key(account):
     return hashlib.sha256(json.dumps([account.get(f) for f in fields], separators=(",", ":")).encode()).hexdigest()
 
 
+def compute_notice_key(doc, account):
+    """Reserve one source-document flag update, without deduplicating other chat."""
+    raw = doc.get("rereply_after_send")
+    if not raw:
+        return None
+    try:
+        descriptor = json.loads(raw)
+        if not isinstance(descriptor, dict) or set(descriptor) != {"doctype", "name", "fieldname", "value"}:
+            raise ValueError
+        if not all(isinstance(descriptor[field], str) and descriptor[field] for field in ("doctype", "name", "fieldname")):
+            raise ValueError
+        if (descriptor["doctype"] != doc.get("reference_doctype")
+                or descriptor["name"] != doc.get("reference_name")
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", descriptor["fieldname"])):
+            raise ValueError
+        canonical = json.dumps([
+            account.name, descriptor["doctype"], descriptor["name"],
+            descriptor["fieldname"], descriptor["value"],
+        ], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        frappe.throw("The deferred ReReply update must match this message's source document.")
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def insert_rereply_notice(doc, ignore_permissions=False):
+    """Insert once per business notice, or return its existing durable intent.
+
+    The unique database key closes the race after the optimistic lookup. A
+    failed or uncertain prior attempt keeps its reservation; explicit retry
+    must reuse that row so another document event cannot resend it silently.
+    """
+    doc.set_whatsapp_account()
+    account = frappe.get_doc("WhatsApp Account", doc.whatsapp_account)
+    if not uses_rereply(account) or not doc.get("rereply_after_send"):
+        return doc.insert(ignore_permissions=ignore_permissions)
+    if doc.type != "Outgoing":
+        frappe.throw("Only outgoing ReReply messages can reserve a business notice.")
+    if not ignore_permissions:
+        doc.check_permission("create")
+    key = compute_notice_key(doc, account)
+    doc.rereply_notice_key = key
+    existing = frappe.db.get_value("WhatsApp Message", {"rereply_notice_key": key}, "name")
+    if existing:
+        result = frappe.get_doc("WhatsApp Message", existing)
+        if not ignore_permissions:
+            result.check_permission("read")
+        return result
+    savepoint = "rereply_notice_" + uuid4().hex
+    frappe.db.savepoint(savepoint)
+    message_log = getattr(frappe.local, "message_log", None)
+    message_count = len(message_log) if isinstance(message_log, list) else None
+    try:
+        return doc.insert(ignore_permissions=ignore_permissions)
+    except (frappe.DuplicateEntryError, frappe.UniqueValidationError):
+        frappe.db.rollback(save_point=savepoint)
+        # A normal SELECT can retain a pre-race repeatable-read snapshot.
+        # The locking read sees the winning insert after its commit.
+        rows = frappe.db.sql(
+            "SELECT name FROM `tabWhatsApp Message` WHERE rereply_notice_key=%s FOR UPDATE", (key,)
+        )
+        if not rows:
+            raise
+        # Frappe may append a uniqueness popup before throwing. This race is
+        # handled, so remove only messages from this failed insert attempt.
+        if message_count is not None:
+            del message_log[message_count:]
+        result = frappe.get_doc("WhatsApp Message", rows[0][0])
+        if not ignore_permissions:
+            result.check_permission("read")
+        return result
+
+
 def prepare_message(doc, account, payload):
     if doc.get("rereply_send_state") in ("Sending", "Sent", "Unknown"):
         frappe.throw("This ReReply message was already attempted. Reconcile its delivery before sending again.")
@@ -31,6 +105,7 @@ def prepare_message(doc, account, payload):
     doc.rereply_source = "erp"
     doc.rereply_requested_by = frappe.session.user
     doc.rereply_route_key = route_key(account)
+    doc.rereply_notice_key = compute_notice_key(doc, account)
     doc.status = "Queued"
 
 

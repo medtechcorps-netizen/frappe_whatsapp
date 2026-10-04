@@ -71,6 +71,11 @@ class WhatsAppMessage(Document):
         from frappe_whatsapp.utils.rereply_queue import enqueue_message
         enqueue_message(self)
 
+    def insert_rereply_notice(self, ignore_permissions=False):
+        """Internal server-script helper; not exposed as an HTTP method."""
+        from frappe_whatsapp.utils.rereply_queue import insert_rereply_notice
+        return insert_rereply_notice(self, ignore_permissions=ignore_permissions)
+
     def send_outgoing(self):
         """Dispatch an Outgoing message to Meta.
 

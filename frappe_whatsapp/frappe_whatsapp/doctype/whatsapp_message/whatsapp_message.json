@@ -53,7 +53,8 @@
   "rereply_requested_by",
   "rereply_route_key",
   "rereply_status_checked_at",
-  "rereply_after_send"
+  "rereply_after_send",
+  "rereply_notice_key"
  ],
  "fields": [
   {
@@ -360,6 +361,15 @@
    "label": "ReReply After Send Update",
    "read_only": 1,
    "hidden": 1
+  },
+  {
+   "fieldname": "rereply_notice_key",
+   "fieldtype": "Data",
+   "label": "ReReply Business Notice Key",
+   "read_only": 1,
+   "hidden": 1,
+   "no_copy": 1,
+   "unique": 1
   }
  ],
  "index_web_pages_for_search": 1,

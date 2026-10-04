@@ -31,6 +31,8 @@ class WhatsAppAccount(Document):
 				frappe.throw(_("The ReReply integration user ID must be a UUID."))
 		if self.get("rereply_inbound_enabled") and not self.get("rereply_outbound_enabled"):
 			frappe.throw(_("Enable and validate ReReply sending before enabling incoming ERP automation."))
+		if self.get("rereply_inbound_enabled") and not self.get("rereply_integration_user_id"):
+			frappe.throw(_("A dedicated ReReply integration user ID is required to distinguish ERP replies from staff activity."))
 		if self.get("rereply_outbound_enabled") and not self.get_password("rereply_api_key", raise_exception=False):
 			frappe.throw(_("A ReReply API key is required before sending is enabled."))
 		if self.get("rereply_inbound_enabled") and not self.get_password("rereply_webhook_secret", raise_exception=False):
